@@ -387,16 +387,6 @@ def _show_authentication():
         st.markdown("<div class='glass-card'><div class='metric-label'>SYSTEM STATUS</div><h3 style='color:#91f2df'>● ONLINE</h3><p>Protected workspace</p><p>Account security</p><p>Security event logging</p></div>",unsafe_allow_html=True)
     st.stop()
 
-_bootstrap_admin()
-_current_user=None
-_saved_token=st.session_state.get("nexus_token")
-if _saved_token:
-    service=AuthenticationService()
-    try: _current_user=service.verify_session(_saved_token)
-    finally: service.close()
-if not _current_user:
-    st.session_state.pop("nexus_token",None)
-    _show_authentication()
 
 # =========================================================
 # LOAD PROJECT DATA
@@ -509,6 +499,27 @@ def render_3d_globe():
     </script>
     """
     components.html(html, height=405, scrolling=False)
+
+
+# =========================================================
+# NEXUS AUTHENTICATION AND ROLE CONTROL — EXECUTION
+# Defined after render_3d_globe so login screen can call it safely.
+# =========================================================
+
+_bootstrap_admin()
+_current_user = None
+_saved_token = st.session_state.get("nexus_token")
+
+if _saved_token:
+    service = AuthenticationService()
+    try:
+        _current_user = service.verify_session(_saved_token)
+    finally:
+        service.close()
+
+if not _current_user:
+    st.session_state.pop("nexus_token", None)
+    _show_authentication()
 
 
 # =========================================================
