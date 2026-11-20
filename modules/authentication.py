@@ -1,247 +1,59 @@
-
-import hashlib
-import hmac
-import secrets
-from datetime import datetime, timedelta, timezone
-
+import hashlib, hmac, secrets, re
 from modules.database_manager import DatabaseManager
 
-
-PBKDF2_ITERATIONS = 600_000
-MAX_FAILED_ATTEMPTS = 5
-LOCKOUT_MINUTES = 10
-SESSION_HOURS = 8
-
-
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def hash_password(password):
-    if len(password) < 10:
-        raise ValueError("Password must contain at least 10 characters.")
-
-    salt = secrets.token_bytes(16)
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        PBKDF2_ITERATIONS
-    )
-
-    return (
-        f"pbkdf2_sha256${PBKDF2_ITERATIONS}"
-        f"${salt.hex()}${password_hash.hex()}"
-    )
-
-
-def verify_password(password, stored_hash):
-    try:
-        algorithm, iterations, salt_hex, hash_hex = stored_hash.split("$")
-
-        if algorithm != "pbkdf2_sha256":
-            return False
-
-        calculated = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            bytes.fromhex(salt_hex),
-            int(iterations)
-        )
-
-        return hmac.compare_digest(calculated.hex(), hash_hex)
-
-    except (ValueError, TypeError):
-        return False
-
-
 class AuthenticationService:
-    def __init__(self, db=None):
-        self.db = db or DatabaseManager()
-
-    def register_user(self, username, email, password):
-        username = username.strip()
-
-        if len(username) < 3:
-            raise ValueError("Username must contain at least 3 characters.")
-
-        if not username.replace("_", "").isalnum():
-            raise ValueError("Use only letters, numbers and underscores.")
-
-        password_hash = hash_password(password)
-
-        user_id = self.db.create_user(
-            username=username,
-            email=email,
-            password_hash=password_hash,
-            role="user"
-        )
-
-        self.db.add_security_event(
-            username, None, "REGISTER", "SUCCESS",
-            "New user account registered.", "INFO"
-        )
-
-        self.db.add_audit_log(
-            username, "USER_REGISTERED", username,
-            "New user registration."
-        )
-
-        return user_id
-
-    def _failed_attempts(self, username):
-        cutoff = (
-            now_utc() - timedelta(minutes=LOCKOUT_MINUTES)
-        ).isoformat(timespec="seconds")
-
-        row = self.db.connection.execute("""
-            SELECT COUNT(*) AS total
-            FROM security_events
-            WHERE username = ? COLLATE NOCASE
-              AND event_type = 'LOGIN'
-              AND status = 'FAILED'
-              AND timestamp >= ?
-        """, (username, cutoff)).fetchone()
-
-        return row["total"]
-
-    def login(self, username, password, source_ip="Unknown",
-              device_info="Unknown device"):
-
-        username = username.strip()
-        user = self.db.get_user(username)
-
-        if user and user["status"] != "active":
-            self.db.add_security_event(
-                username, source_ip, "LOGIN", "DENIED",
-                "Account is not active.", "HIGH"
-            )
-            return {"success": False, "message": "Account is blocked or locked."}
-
-        if self._failed_attempts(username) >= MAX_FAILED_ATTEMPTS:
-            if user:
-                self.db.update_user_status(username, "locked")
-
-            self.db.add_security_event(
-                username, source_ip, "LOGIN", "DENIED",
-                "Too many recent failed login attempts.", "HIGH"
-            )
-
-            self.db.add_alert(
-                username, source_ip, "ACCOUNT_LOCKOUT", "HIGH",
-                "Repeated failed login attempts detected."
-            )
-
-            return {
-                "success": False,
-                "message": "Too many failed attempts. Contact the administrator."
-            }
-
-        if not user or not verify_password(password, user["password_hash"]):
-            self.db.add_security_event(
-                username, source_ip, "LOGIN", "FAILED",
-                "Invalid username or password.", "MEDIUM"
-            )
-
-            if self._failed_attempts(username) >= MAX_FAILED_ATTEMPTS:
-                if user:
-                    self.db.update_user_status(username, "locked")
-
-                self.db.add_alert(
-                    username, source_ip, "REPEATED_LOGIN_FAILURES", "HIGH",
-                    "Five or more failed login attempts within ten minutes."
-                )
-
-            return {"success": False, "message": "Invalid username or password."}
-
-        token = secrets.token_urlsafe(32)
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-
-        created = now_utc()
-        expires = created + timedelta(hours=SESSION_HOURS)
-
-        session_id = self.db.create_session(
-            user_id=user["id"],
-            token_hash=token_hash,
-            device_info=device_info,
-            source_ip=source_ip,
-            expires_at=expires.isoformat(timespec="seconds")
-        )
-
-        self.db.update_last_login(user["id"])
-
-        self.db.add_security_event(
-            username, source_ip, "LOGIN", "SUCCESS",
-            "User login successful.", "INFO"
-        )
-
-        self.db.add_audit_log(
-            username, "USER_LOGIN", username,
-            "Successful login."
-        )
-
-        return {
-            "success": True,
-            "message": "Login successful.",
-            "token": token,
-            "session_id": session_id,
-            "user": {
-                "id": user["id"],
-                "username": user["username"],
-                "role": user["role"]
-            }
-        }
-
-    def verify_session(self, token):
-        if not token:
-            return None
-
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        session = self.db.get_session(token_hash)
-
-        if not session:
-            return None
-
-        if session["revoked"] or session["status"] != "active":
-            return None
-
+    ITERATIONS = 240000
+    def __init__(self, db_path=None): self.db = DatabaseManager(db_path)
+    @classmethod
+    def hash_password(cls, password):
+        salt=secrets.token_bytes(16); digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt,cls.ITERATIONS)
+        return f'pbkdf2_sha256${cls.ITERATIONS}${salt.hex()}${digest.hex()}'
+    @staticmethod
+    def verify_password(password, stored):
         try:
-            expires = datetime.fromisoformat(session["expires_at"])
-            if expires <= now_utc():
-                return None
-        except ValueError:
-            return None
-
-        return {
-            "id": session["user_id"],
-            "username": session["username"],
-            "role": session["role"],
-            "session_id": session["id"]
-        }
-
-    def logout(self, token):
-        if not token:
+            algo,iters,salt,digest=stored.split('$')
+            if algo!='pbkdf2_sha256': return False
+            check=hashlib.pbkdf2_hmac('sha256',password.encode(),bytes.fromhex(salt),int(iters)).hex()
+            return hmac.compare_digest(check,digest)
+        except Exception: return False
+    def register_user(self, username, email, password):
+        username=(username or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{3,30}',username): raise ValueError('Username must be 3–30 characters: letters, numbers, dot, underscore or hyphen.')
+        if len(password or '')<8: raise ValueError('Password must contain at least 8 characters.')
+        if self.db.get_user(username): raise ValueError('Username already exists.')
+        self.db.create_user(username,email,self.hash_password(password),'user')
+        self.db.add_security_event(username,'Registration','REGISTER','SUCCESS','Account created')
+        self.db.add_audit_log(username,'REGISTER','ACCOUNT','User self-registration')
+    def create_admin(self, username, password):
+        username=(username or '').strip()
+        if len(password or '')<12: raise ValueError('Admin password must be at least 12 characters.')
+        existing=self.db.get_user(username)
+        if existing:
+            if existing['role']!='admin': raise ValueError('This username already belongs to a normal user. Choose another admin username.')
+            # Streamlit Secrets are the authority for the configured bootstrap admin password.
+            self.db.connection.execute('UPDATE users SET password_hash=?,status="active" WHERE username=? COLLATE NOCASE',(self.hash_password(password),username))
+            self.db.connection.commit()
             return False
-
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
-        session = self.db.get_session(token_hash)
-
-        if not session:
-            return False
-
-        self.db.revoke_session(session["id"])
-
-        self.db.add_security_event(
-            session["username"], session["source_ip"],
-            "LOGOUT", "SUCCESS", "User logged out.", "INFO"
-        )
-
-        self.db.add_audit_log(
-            session["username"], "USER_LOGOUT",
-            session["username"], "User logged out."
-        )
-
+        self.db.create_user(username,'',self.hash_password(password),'admin')
+        self.db.add_audit_log('SYSTEM','ADMIN_BOOTSTRAP',username,'Admin provisioned from Streamlit secrets')
         return True
-
-    def close(self):
-        self.db.close()
+    def login(self, username, password, source_ip='Unknown', device_info='Browser'):
+        user=self.db.get_user((username or '').strip())
+        if not user or not self.verify_password(password or '',user['password_hash']):
+            self.db.add_security_event((username or 'unknown').strip(),source_ip,'LOGIN','FAILED','Invalid credentials')
+            return {'success':False,'message':'Invalid username or password.'}
+        if user['status']!='active':
+            self.db.add_security_event(user['username'],source_ip,'LOGIN','DENIED','Account blocked or locked')
+            return {'success':False,'message':'Account is blocked or locked. Contact administrator.'}
+        token=secrets.token_urlsafe(36); token_hash=hashlib.sha256(token.encode()).hexdigest()
+        self.db.add_session(user['id'],token_hash,source_ip,device_info)
+        self.db.add_security_event(user['username'],source_ip,'LOGIN','SUCCESS','Login successful')
+        return {'success':True,'token':token}
+    def verify_session(self, token):
+        if not token: return None
+        digest=hashlib.sha256(token.encode()).hexdigest(); user=self.db.get_session_user(digest)
+        if not user or user['status']!='active': return None
+        return {k:user[k] for k in ('id','username','email','role','status')}
+    def logout(self, token):
+        if token: self.db.revoke_token(hashlib.sha256(token.encode()).hexdigest())
+    def close(self): self.db.close()
