@@ -1,6 +1,8 @@
+
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB = BASE_DIR / "database" / "cyber_threats.db"
@@ -31,7 +33,12 @@ class DatabaseManager:
 
         self.create_tables()
 
+    # --------------------------------------------------
+    # DATABASE TABLES
+    # --------------------------------------------------
+
     def create_tables(self):
+
         self.connection.executescript("""
         CREATE TABLE IF NOT EXISTS security_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,22 +103,45 @@ class DatabaseManager:
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            actor TEXT,
+            actor_username TEXT,
             action TEXT,
-            target TEXT,
+            target_username TEXT,
             details TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_events_username
+        ON security_events(username);
+
+        CREATE INDEX IF NOT EXISTS idx_events_type_status
+        ON security_events(event_type, status);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_user
+        ON sessions(user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_alerts_status
+        ON alerts(status);
         """)
 
         self.connection.commit()
 
+    # --------------------------------------------------
+    # COMMON DATABASE HELPER
+    # --------------------------------------------------
+
     def _rows(self, sql, params=()):
         return [
             dict(row)
-            for row in self.connection.execute(sql, params).fetchall()
+            for row in self.connection.execute(
+                sql, params
+            ).fetchall()
         ]
 
+    # --------------------------------------------------
+    # SECURITY LOGS
+    # --------------------------------------------------
+
     def save_logs(self, events):
+
         self.connection.executemany(
             """
             INSERT INTO security_logs
@@ -129,9 +159,21 @@ class DatabaseManager:
                 for event in events
             ]
         )
+
         self.connection.commit()
 
+    def get_logs(self):
+
+        return self._rows(
+            "SELECT * FROM security_logs ORDER BY id DESC"
+        )
+
+    # --------------------------------------------------
+    # INCIDENTS
+    # --------------------------------------------------
+
     def save_incidents(self, incidents):
+
         self.connection.executemany(
             """
             INSERT INTO incidents
@@ -149,19 +191,21 @@ class DatabaseManager:
                 for incident in incidents
             ]
         )
+
         self.connection.commit()
 
-    def get_logs(self):
-        return self._rows(
-            "SELECT * FROM security_logs ORDER BY id DESC"
-        )
-
     def get_incidents(self):
+
         return self._rows(
             "SELECT * FROM incidents ORDER BY id DESC"
         )
 
+    # --------------------------------------------------
+    # USERS
+    # --------------------------------------------------
+
     def create_user(self, username, email, password_hash, role="user"):
+
         timestamp = current_timestamp()
 
         cursor = self.connection.execute(
@@ -181,28 +225,68 @@ class DatabaseManager:
         )
 
         self.connection.commit()
+
         return cursor.lastrowid
 
     def get_user(self, username):
+
         rows = self._rows(
             "SELECT * FROM users WHERE username=? COLLATE NOCASE",
             (username,)
         )
+
         return rows[0] if rows else None
 
+    def get_all_users(self):
+
+        return self._rows(
+            """
+            SELECT id, username, email, role, status, created_at
+            FROM users
+            ORDER BY id DESC
+            """
+        )
+
+    def update_user_status(self, username, status):
+
+        self.connection.execute(
+            """
+            UPDATE users
+            SET status=?
+            WHERE username=? COLLATE NOCASE
+            """,
+            (status, username)
+        )
+
+        self.connection.commit()
+
+    # --------------------------------------------------
+    # SESSIONS
+    # --------------------------------------------------
+
     def get_session_user(self, token_hash):
+
         rows = self._rows(
             """
-            SELECT u.id, u.username, u.email, u.role, u.status
+            SELECT
+                u.id,
+                u.username,
+                u.email,
+                u.role,
+                u.status
             FROM sessions s
             JOIN users u ON u.id = s.user_id
-            WHERE s.token_hash=? AND s.revoked=0
+            WHERE s.token_hash=?
+              AND s.revoked=0
+              AND u.status='active'
             """,
             (token_hash,)
         )
+
         return rows[0] if rows else None
 
     def add_session(self, user_id, token_hash, source_ip, device_info):
+
         self.connection.execute(
             """
             INSERT INTO sessions
@@ -218,52 +302,59 @@ class DatabaseManager:
                 0
             )
         )
+
         self.connection.commit()
 
     def revoke_token(self, token_hash):
+
         self.connection.execute(
             "UPDATE sessions SET revoked=1 WHERE token_hash=?",
             (token_hash,)
         )
+
         self.connection.commit()
 
     def revoke_user_sessions(self, user_id):
+
         self.connection.execute(
             "UPDATE sessions SET revoked=1 WHERE user_id=?",
             (user_id,)
         )
-        self.connection.commit()
 
-    def get_all_users(self):
-        return self._rows(
-            """
-            SELECT id, username, email, role, status, created_at
-            FROM users ORDER BY id DESC
-            """
-        )
-
-    def update_user_status(self, username, status):
-        self.connection.execute(
-            "UPDATE users SET status=? WHERE username=? COLLATE NOCASE",
-            (status, username)
-        )
         self.connection.commit()
 
     def get_active_sessions(self):
+
         return self._rows(
             """
-            SELECT s.id, u.username, u.role, s.source_ip,
-                   s.device_info, s.created_at
+            SELECT
+                s.id,
+                u.username,
+                u.role,
+                s.source_ip,
+                s.device_info,
+                s.created_at
             FROM sessions s
             JOIN users u ON u.id=s.user_id
-            WHERE s.revoked=0 AND u.status='active'
+            WHERE s.revoked=0
+              AND u.status='active'
             ORDER BY s.id DESC
             """
         )
 
+    # --------------------------------------------------
+    # SECURITY EVENTS
+    # --------------------------------------------------
+
     def add_security_event(
-        self, username, source_ip, event_type, status, details=""
+        self,
+        username,
+        source_ip,
+        event_type,
+        status,
+        details=""
     ):
+
         timestamp = current_timestamp()
 
         self.connection.execute(
@@ -281,67 +372,124 @@ class DatabaseManager:
                 details
             )
         )
+
         self.connection.commit()
 
+        # Detect repeated failed logins in the last 15 minutes.
         if event_type == "LOGIN" and status == "FAILED":
+
             result = self.connection.execute(
                 """
                 SELECT COUNT(*)
                 FROM security_events
                 WHERE username=?
-                AND event_type='LOGIN'
-                AND status='FAILED'
-                AND timestamp >= datetime('now', '-15 minutes')
+                  AND source_ip IS ?
+                  AND event_type='LOGIN'
+                  AND status='FAILED'
+                  AND timestamp >= datetime('now', '-15 minutes')
                 """,
-                (username,)
+                (username, source_ip)
             ).fetchone()
 
             count = result[0]
 
-            if count == 3:
-                self.connection.execute(
+            if count >= 3:
+
+                existing = self.connection.execute(
                     """
-                    INSERT INTO alerts
-                    (timestamp, username, source_ip, threat,
-                     severity, details, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    SELECT id
+                    FROM alerts
+                    WHERE username=?
+                      AND source_ip IS ?
+                      AND threat='Repeated Failed Login Attempts'
+                      AND status='open'
+                    LIMIT 1
                     """,
-                    (
-                        current_timestamp(),
-                        username,
-                        source_ip,
-                        "Repeated Failed Login Attempts",
-                        "HIGH",
-                        f"{count} failed attempts in 15 minutes",
-                        "open"
+                    (username, source_ip)
+                ).fetchone()
+
+                if not existing:
+
+                    self.connection.execute(
+                        """
+                        INSERT INTO alerts
+                        (
+                            timestamp,
+                            username,
+                            source_ip,
+                            threat,
+                            severity,
+                            details,
+                            status
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            current_timestamp(),
+                            username,
+                            source_ip,
+                            "Repeated Failed Login Attempts",
+                            "HIGH",
+                            f"{count} failed attempts in 15 minutes",
+                            "open"
+                        )
                     )
-                )
-                self.connection.commit()
+
+                    self.connection.commit()
 
     def get_security_events(self, limit=500):
+
         return self._rows(
-            "SELECT * FROM security_events ORDER BY id DESC LIMIT ?",
+            """
+            SELECT *
+            FROM security_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (int(limit),)
         )
 
+    # --------------------------------------------------
+    # ALERTS
+    # --------------------------------------------------
+
     def get_alerts(self, limit=500):
+
         return self._rows(
-            "SELECT * FROM alerts ORDER BY id DESC LIMIT ?",
+            """
+            SELECT *
+            FROM alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (int(limit),)
         )
 
     def update_alert_status(self, alert_id, status):
+
         self.connection.execute(
             "UPDATE alerts SET status=? WHERE id=?",
             (status, alert_id)
         )
+
         self.connection.commit()
 
+    # --------------------------------------------------
+    # AUDIT LOGS
+    # --------------------------------------------------
+
     def add_audit_log(self, actor, action, target, details):
+
         self.connection.execute(
             """
             INSERT INTO audit_logs
-            (timestamp, actor, action, target, details)
+            (
+                timestamp,
+                actor_username,
+                action,
+                target_username,
+                details
+            )
             VALUES (?, ?, ?, ?, ?)
             """,
             (
@@ -352,13 +500,26 @@ class DatabaseManager:
                 details
             )
         )
+
         self.connection.commit()
 
     def get_audit_logs(self, limit=500):
+
         return self._rows(
-            "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?",
+            """
+            SELECT *
+            FROM audit_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (int(limit),)
         )
 
+    # --------------------------------------------------
+    # CLOSE DATABASE CONNECTION
+    # --------------------------------------------------
+
     def close(self):
-        self.connection.close()
+
+        if self.connection:
+            self.connection.close()

@@ -1,3 +1,4 @@
+
 import hashlib
 import hmac
 import secrets
@@ -49,10 +50,20 @@ class AuthenticationService:
         except Exception:
             return False
 
-    def register_user(self, username, email, password):
+    def register_user(
+        self,
+        username,
+        email,
+        password,
+        source_ip="Unknown"
+    ):
         username = (username or "").strip()
+        email = (email or "").strip()
 
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,30}", username):
+        if not re.fullmatch(
+            r"[A-Za-z0-9_.-]{3,30}",
+            username
+        ):
             raise ValueError(
                 "Username must be 3-30 characters: "
                 "letters, numbers, dot, underscore or hyphen."
@@ -75,7 +86,7 @@ class AuthenticationService:
 
         self.db.add_security_event(
             username,
-            "Registration",
+            source_ip,
             "REGISTER",
             "SUCCESS",
             "Account created"
@@ -90,6 +101,9 @@ class AuthenticationService:
 
     def create_admin(self, username, password):
         username = (username or "").strip()
+
+        if not username:
+            raise ValueError("Admin username is required.")
 
         if len(password or "") < 12:
             raise ValueError(
@@ -115,6 +129,14 @@ class AuthenticationService:
             )
 
             self.db.connection.commit()
+
+            self.db.add_audit_log(
+                "SYSTEM",
+                "ADMIN_UPDATE",
+                username,
+                "Admin credentials refreshed"
+            )
+
             return False
 
         self.db.create_user(
@@ -195,6 +217,13 @@ class AuthenticationService:
             "Login successful"
         )
 
+        self.db.add_audit_log(
+            user["username"],
+            "LOGIN",
+            "SESSION",
+            "Successful login"
+        )
+
         return {
             "success": True,
             "token": token
@@ -216,9 +245,41 @@ class AuthenticationService:
         }
 
     def logout(self, token):
-        if token:
-            digest = hashlib.sha256(token.encode()).hexdigest()
-            self.db.revoke_token(digest)
+        if not token:
+            return
+
+        digest = hashlib.sha256(token.encode()).hexdigest()
+
+        row = self.db.connection.execute(
+            """
+            SELECT u.username, s.source_ip
+            FROM sessions s
+            JOIN users u ON u.id=s.user_id
+            WHERE s.token_hash=? AND s.revoked=0
+            """,
+            (digest,)
+        ).fetchone()
+
+        if row:
+            username = row["username"]
+            source_ip = row["source_ip"] or "Unknown"
+
+            self.db.add_security_event(
+                username,
+                source_ip,
+                "LOGOUT",
+                "SUCCESS",
+                "User logged out"
+            )
+
+            self.db.add_audit_log(
+                username,
+                "LOGOUT",
+                "SESSION",
+                "Session revoked"
+            )
+
+        self.db.revoke_token(digest)
 
     def close(self):
         self.db.close()
