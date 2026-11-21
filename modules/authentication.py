@@ -14,13 +14,17 @@ class AuthenticationService:
     def __init__(self, db_path=None):
         self.db = DatabaseManager(db_path)
 
+    # -----------------------------------------
+    # PASSWORD HASHING
+    # -----------------------------------------
+
     @classmethod
     def hash_password(cls, password):
         salt = secrets.token_bytes(16)
 
         digest = hashlib.pbkdf2_hmac(
             "sha256",
-            password.encode(),
+            password.encode("utf-8"),
             salt,
             cls.ITERATIONS
         )
@@ -40,15 +44,19 @@ class AuthenticationService:
 
             check = hashlib.pbkdf2_hmac(
                 "sha256",
-                password.encode(),
+                password.encode("utf-8"),
                 bytes.fromhex(salt),
                 int(iterations)
             ).hex()
 
             return hmac.compare_digest(check, digest)
 
-        except Exception:
+        except (ValueError, TypeError, AttributeError):
             return False
+
+    # -----------------------------------------
+    # REGISTER USER
+    # -----------------------------------------
 
     def register_user(
         self,
@@ -99,6 +107,10 @@ class AuthenticationService:
             "User self-registration"
         )
 
+    # -----------------------------------------
+    # ADMIN BOOTSTRAP
+    # -----------------------------------------
+
     def create_admin(self, username, password):
         username = (username or "").strip()
 
@@ -115,28 +127,13 @@ class AuthenticationService:
         if existing:
             if existing["role"] != "admin":
                 raise ValueError(
-                    "This username already belongs to a normal user. "
-                    "Choose another admin username."
+                    "This username already belongs to a normal user."
                 )
 
-            self.db.connection.execute(
-                """
-                UPDATE users
-                SET password_hash=?, status='active'
-                WHERE username=? COLLATE NOCASE
-                """,
-                (self.hash_password(password), username)
-            )
+            if existing["status"] != "active":
+                self.db.update_user_status(username, "active")
 
-            self.db.connection.commit()
-
-            self.db.add_audit_log(
-                "SYSTEM",
-                "ADMIN_UPDATE",
-                username,
-                "Admin credentials refreshed"
-            )
-
+            # Existing admin password is not reset on every rerun.
             return False
 
         self.db.create_user(
@@ -155,6 +152,10 @@ class AuthenticationService:
 
         return True
 
+    # -----------------------------------------
+    # LOGIN
+    # -----------------------------------------
+
     def login(
         self,
         username,
@@ -163,6 +164,7 @@ class AuthenticationService:
         device_info="Browser"
     ):
         username = (username or "").strip()
+
         user = self.db.get_user(username)
 
         if not user or not self.verify_password(
@@ -200,7 +202,9 @@ class AuthenticationService:
             }
 
         token = secrets.token_urlsafe(36)
-        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        token_hash = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
 
         self.db.add_session(
             user["id"],
@@ -229,11 +233,18 @@ class AuthenticationService:
             "token": token
         }
 
+    # -----------------------------------------
+    # VERIFY SESSION
+    # -----------------------------------------
+
     def verify_session(self, token):
         if not token:
             return None
 
-        digest = hashlib.sha256(token.encode()).hexdigest()
+        digest = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
+
         user = self.db.get_session_user(digest)
 
         if not user or user["status"] != "active":
@@ -241,24 +252,28 @@ class AuthenticationService:
 
         return {
             key: user[key]
-            for key in ("id", "username", "email", "role", "status")
+            for key in (
+                "id",
+                "username",
+                "email",
+                "role",
+                "status"
+            )
         }
+
+    # -----------------------------------------
+    # LOGOUT
+    # -----------------------------------------
 
     def logout(self, token):
         if not token:
             return
 
-        digest = hashlib.sha256(token.encode()).hexdigest()
+        digest = hashlib.sha256(
+            token.encode("utf-8")
+        ).hexdigest()
 
-        row = self.db.connection.execute(
-            """
-            SELECT u.username, s.source_ip
-            FROM sessions s
-            JOIN users u ON u.id=s.user_id
-            WHERE s.token_hash=? AND s.revoked=0
-            """,
-            (digest,)
-        ).fetchone()
+        row = self.db.get_session_details(digest)
 
         if row:
             username = row["username"]
@@ -280,6 +295,10 @@ class AuthenticationService:
             )
 
         self.db.revoke_token(digest)
+
+    # -----------------------------------------
+    # CLOSE DATABASE
+    # -----------------------------------------
 
     def close(self):
         self.db.close()
